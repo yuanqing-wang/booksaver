@@ -5,31 +5,14 @@ SOURCES  = BookSaverView.swift
 ARCH    := $(shell uname -m | tr -d '[:space:]')
 TARGET   = $(ARCH)-apple-macos12.0
 
-FONTS_DIR       = Fonts
-FONT_VARIABLE   = $(FONTS_DIR)/Montserrat-Variable.ttf
-FONT_ITALIC_VAR = $(FONTS_DIR)/Montserrat-Italic-Variable.ttf
-FONT_URL        = https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf
-FONT_ITALIC_URL = https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Italic%5Bwght%5D.ttf
-
 # Popular Gutenberg book IDs to bundle as pre-loaded texts (first 80 KB each).
 TEXTS_DIR   = Texts
 PRELOAD_IDS = 1342 84 11 2701 76 345 174 1661 98 2554 5200 46 1184 768 1260 \
               74 161 219 514 730 36 43 120 205 600
 
-.PHONY: all install uninstall clean fonts texts
+.PHONY: all install uninstall clean texts
 
 all: $(BUNDLE)
-
-# ── Font download ─────────────────────────────────────────────────────────────
-fonts: $(FONT_VARIABLE) $(FONT_ITALIC_VAR)
-
-$(FONT_VARIABLE):
-	mkdir -p $(FONTS_DIR)
-	curl -fL -o $@ "$(FONT_URL)"
-
-$(FONT_ITALIC_VAR):
-	mkdir -p $(FONTS_DIR)
-	curl -fL -o $@ "$(FONT_ITALIC_URL)"
 
 # ── Text pre-loading (parallel, skips files that already exist) ───────────────
 texts:
@@ -44,23 +27,21 @@ texts:
 	@echo "Texts ready."
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-$(BUNDLE): $(SOURCES) Info.plist fonts
+$(BUNDLE): $(SOURCES) Info.plist
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	mkdir -p $(BUNDLE)/Contents/Resources
 	swiftc \
+		-O \
 		-target $(TARGET) \
 		-framework ScreenSaver \
 		-framework AppKit \
 		-framework Foundation \
-		-framework CoreText \
 		-module-name BookSaver \
 		-parse-as-library \
 		-Xlinker -bundle \
 		-o $(BINARY) \
 		$(SOURCES)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
-	cp $(FONT_VARIABLE)   $(BUNDLE)/Contents/Resources/
-	cp $(FONT_ITALIC_VAR) $(BUNDLE)/Contents/Resources/
 	@echo "Built $(BUNDLE)"
 
 # ── Install / uninstall ───────────────────────────────────────────────────────

@@ -1,6 +1,5 @@
 import ScreenSaver
 import AppKit
-import CoreText
 
 @objc(BookSaverView)
 class BookSaverView: ScreenSaverView {
@@ -156,61 +155,51 @@ class BookSaverView: ScreenSaverView {
     private let dimColor  = NSColor(white: 0.36, alpha: 1)
 
     private var fontSize: CGFloat { isPreview ? 9 : max(26, bounds.width / 40) }
-
-    private var textFont: NSFont {
-        let sz = fontSize
-        return NSFont(name: "Montserrat-Regular", size: sz)
-            ?? NSFont(name: "Montserrat", size: sz)
-            ?? NSFont.systemFont(ofSize: sz, weight: .regular)
-    }
     private var metaFontSize: CGFloat { isPreview ? 7 : fontSize * 0.62 }
-    private var metaFont: NSFont {
-        let sz = metaFontSize
-        return NSFont(name: "Montserrat-Italic", size: sz)
-            ?? NSFont(name: "Montserrat", size: sz)
-            ?? NSFont.systemFont(ofSize: sz, weight: .regular)
-    }
     private var metaAreaHeight: CGFloat { metaFontSize * 3.2 }
     private var lineHeight: CGFloat     { fontSize * 1.45 }
     private var sideMargin: CGFloat     { bounds.width * 0.04 }
     private var textWidth:  CGFloat     { bounds.width - sideMargin * 2 }
     private var scrollSpeed: CGFloat    { isPreview ? 0.35 : 0.9 }
 
+    private var textFont: NSFont { .systemFont(ofSize: fontSize,            weight: .regular) }
+    private var metaFont: NSFont { .systemFont(ofSize: fontSize * 0.62,     weight: .light) }
+
+    // Gradient is invariant — create once rather than every frame.
+    private lazy var fadeGradient: NSGradient? = NSGradient(
+        colors: [bgColor.withAlphaComponent(0), bgColor],
+        atLocations: [0, 1],
+        colorSpace: .genericRGB
+    )
+
     // MARK: - Init
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
         wantsLayer = true
-        registerMontserrat()
         // Defer one run-loop tick so bounds are finalised before we read them.
         DispatchQueue.main.async { [weak self] in self?.loadInitialBook() }
     }
 
+    /// Load a bundled book immediately and kick off the network pre-fetch.
+    /// The bundled book is loaded asynchronously so the main thread is never blocked.
     private func loadInitialBook() {
-        if let b = loadBundledBook() {
-            book = b
-            isLoading = false
+        // Start the network pre-fetch right away so it overlaps with bundled-book processing.
+        fetchNextBook()
+        // Load first displayed book from the bundle in the background.
+        loadBundledBook { [weak self] book in          // called back on main thread
+            guard let self else { return }
+            if let b = book {
+                self.book = b
+                self.isLoading = false
+            }
+            // If the network book arrived first, switch to it now.
+            if self.nextBook != nil { self.advanceBook() }
         }
-        fetchNextBook()   // pre-fetch next (network) while first book is showing
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-    }
-
-    // MARK: - Font registration
-
-    private static var fontsRegistered = false
-
-    private func registerMontserrat() {
-        guard !Self.fontsRegistered else { return }
-        Self.fontsRegistered = true
-        let bundle = Bundle(for: BookSaverView.self)
-        for resource in ["Montserrat-Variable", "Montserrat-Italic-Variable"] {
-            if let url = bundle.url(forResource: resource, withExtension: "ttf") {
-                CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
-            }
-        }
     }
 
     // MARK: - Pipeline
@@ -228,6 +217,12 @@ class BookSaverView: ScreenSaverView {
     private func fetchNextBook() {
         guard !isFetchingNext, let entry = pickEntry() else { return }
         isFetchingNext = true
+
+        // Capture layout values NOW on the main thread.
+        // reflow() will use these on the background thread without touching self.
+        let capturedFont      = textFont
+        let capturedWidth     = textWidth
+        let capturedLineHeight = lineHeight
 
         let url = URL(string: "https://www.gutenberg.org/cache/epub/\(entry.id)/pg\(entry.id).txt")!
         var req = URLRequest(url: url)
@@ -275,19 +270,24 @@ class BookSaverView: ScreenSaverView {
                 return
             }
 
-            // Read layout values and do reflow on main thread (bounds is main-thread-only).
+            // reflow() stays here on the URLSession background thread — no dispatch to main.
+            let lines = Self.reflow(paragraphs, font: capturedFont, maxWidth: capturedWidth)
+            guard !lines.isEmpty else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.isFetchingNext = false; self?.fetchNextBook()
+                }
+                return
+            }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isFetchingNext = false
-
-                let lines = Self.reflow(paragraphs, font: self.textFont, maxWidth: self.textWidth)
-                guard !lines.isEmpty else { self.fetchNextBook(); return }
 
                 self.nextBook = Book(
                     title:       entry.title,
                     author:      entry.author,
                     lines:       lines,
-                    totalHeight: CGFloat(lines.count) * self.lineHeight
+                    totalHeight: CGFloat(lines.count) * capturedLineHeight
                 )
                 if self.isLoading { self.advanceBook() }
             }
@@ -296,55 +296,82 @@ class BookSaverView: ScreenSaverView {
 
     private func advanceBook() {
         if let ready = nextBook {
-            // Network-fetched book is ready — use it.
+            // Network-fetched book is ready — use it instantly.
             book         = ready
             nextBook     = nil
             isLoading    = false
             scrollOffset = 0
             fetchNextBook()
-        } else if let bundled = loadBundledBook() {
-            // Network wasn't ready — fall back to a bundled text instantly.
-            book         = bundled
-            isLoading    = false
-            scrollOffset = 0
-            if !isFetchingNext { fetchNextBook() }
         } else {
-            isLoading = true
+            // Network wasn't ready — fall back to a bundled text.
+            // Show spinner briefly while the async load runs.
             book      = nil
+            isLoading = true
+            loadBundledBook { [weak self] b in      // called back on main thread
+                guard let self else { return }
+                if let b {
+                    self.book         = b
+                    self.isLoading    = false
+                    self.scrollOffset = 0
+                }
+                if !self.isFetchingNext { self.fetchNextBook() }
+            }
         }
     }
 
-    /// Load a random unused pre-bundled text from Resources/Texts/.
-    /// Returns nil only if no bundled texts exist at all.
-    private func loadBundledBook() -> Book? {
+    /// Pick a random unused bundled text URL on the main thread (touches usedIDs),
+    /// then do all file I/O and reflow on a background queue.
+    /// The completion is always called on the main thread.
+    private func loadBundledBook(onComplete: @escaping (Book?) -> Void) {
         let bundle = Bundle(for: BookSaverView.self)
         guard let urls = bundle.urls(forResourcesWithExtension: "txt", subdirectory: "Texts"),
-              !urls.isEmpty else { return nil }
+              !urls.isEmpty else { onComplete(nil); return }
 
-        // Pick an unused bundled file, cycling when all have been shown.
+        // URL selection touches usedIDs — must happen on the main thread (caller's context).
         let unused = urls.filter { !usedIDs.contains(idFrom(url: $0)) }
-        guard let url = (unused.isEmpty ? urls : unused).randomElement() else { return nil }
+        guard let url = (unused.isEmpty ? urls : unused).randomElement() else {
+            onComplete(nil); return
+        }
 
         let id = idFrom(url: url)
         usedIDs.insert(id)
         if usedIDs.count >= Self.catalog.count + urls.count { usedIDs.removeAll() }
 
-        guard let raw = (try? String(contentsOf: url, encoding: .utf8))
-                       ?? (try? String(contentsOf: url, encoding: .isoLatin1)) else { return nil }
-
-        let prefix = raw.prefix(100).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !prefix.hasPrefix("<") else { return nil }
-
         let entry  = Self.catalog.first { $0.id == id }
         let title  = entry?.title  ?? "Classic Literature"
         let author = entry?.author ?? "Project Gutenberg"
 
-        let paragraphs = extractParagraphs(from: raw)
-        guard !paragraphs.isEmpty else { return nil }
-        let lines = Self.reflow(paragraphs, font: textFont, maxWidth: textWidth)
-        guard !lines.isEmpty else { return nil }
-        return Book(title: title, author: author, lines: lines,
-                    totalHeight: CGFloat(lines.count) * lineHeight)
+        // Capture layout values on the main thread before going async.
+        let capturedFont      = textFont
+        let capturedWidth     = textWidth
+        let capturedLineHeight = lineHeight
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { DispatchQueue.main.async { onComplete(nil) }; return }
+
+            guard let raw = (try? String(contentsOf: url, encoding: .utf8))
+                           ?? (try? String(contentsOf: url, encoding: .isoLatin1))
+            else { DispatchQueue.main.async { onComplete(nil) }; return }
+
+            let prefix = raw.prefix(100).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !prefix.hasPrefix("<") else {
+                DispatchQueue.main.async { onComplete(nil) }; return
+            }
+
+            let paragraphs = self.extractParagraphs(from: raw)
+            guard !paragraphs.isEmpty else {
+                DispatchQueue.main.async { onComplete(nil) }; return
+            }
+
+            let lines = Self.reflow(paragraphs, font: capturedFont, maxWidth: capturedWidth)
+            guard !lines.isEmpty else {
+                DispatchQueue.main.async { onComplete(nil) }; return
+            }
+
+            let book = Book(title: title, author: author, lines: lines,
+                            totalHeight: CGFloat(lines.count) * capturedLineHeight)
+            DispatchQueue.main.async { onComplete(book) }
+        }
     }
 
     /// Extract the Gutenberg ID from a filename like "pg1342.txt".
@@ -448,11 +475,10 @@ class BookSaverView: ScreenSaverView {
         }
 
         let fadeH = metaAreaHeight * 1.5
-        NSGradient(colors: [bgColor.withAlphaComponent(0), bgColor],
-                   atLocations: [0, 1],
-                   colorSpace: .genericRGB)?
-            .draw(in: NSRect(x: 0, y: metaAreaHeight, width: bounds.width, height: fadeH),
-                  angle: 270)
+        fadeGradient?.draw(
+            in: NSRect(x: 0, y: metaAreaHeight, width: bounds.width, height: fadeH),
+            angle: 270
+        )
 
         bgColor.setFill()
         NSRect(x: 0, y: 0, width: bounds.width, height: metaAreaHeight).fill()
