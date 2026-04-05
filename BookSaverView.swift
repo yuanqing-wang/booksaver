@@ -184,14 +184,21 @@ class BookSaverView: ScreenSaverView {
     /// Load a bundled book immediately and kick off the network pre-fetch.
     /// The bundled book is loaded asynchronously so the main thread is never blocked.
     private func loadInitialBook() {
+        let t0 = Date()
+        NSLog("[BookSaver] loadInitialBook start")
         // Start the network pre-fetch right away so it overlaps with bundled-book processing.
         fetchNextBook()
+        NSLog("[BookSaver] fetchNextBook kicked off: %.1f ms", Date().timeIntervalSince(t0)*1000)
         // Load first displayed book from the bundle in the background.
         loadBundledBook { [weak self] book in          // called back on main thread
+            NSLog("[BookSaver] loadBundledBook callback: %.1f ms", Date().timeIntervalSince(t0)*1000)
             guard let self else { return }
             if let b = book {
                 self.book = b
                 self.isLoading = false
+                NSLog("[BookSaver] book ready, isLoading=false: %.1f ms", Date().timeIntervalSince(t0)*1000)
+            } else {
+                NSLog("[BookSaver] loadBundledBook returned nil!")
             }
             // If the network book arrived first, switch to it now.
             if self.nextBook != nil { self.advanceBook() }
@@ -346,12 +353,15 @@ class BookSaverView: ScreenSaverView {
         let capturedWidth     = textWidth
         let capturedLineHeight = lineHeight
 
+        let bgStart = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            NSLog("[BookSaver] bg thread start: %.1f ms", Date().timeIntervalSince(bgStart)*1000)
             guard let self else { DispatchQueue.main.async { onComplete(nil) }; return }
 
             guard let raw = (try? String(contentsOf: url, encoding: .utf8))
                            ?? (try? String(contentsOf: url, encoding: .isoLatin1))
             else { DispatchQueue.main.async { onComplete(nil) }; return }
+            NSLog("[BookSaver] file read: %.1f ms", Date().timeIntervalSince(bgStart)*1000)
 
             let prefix = raw.prefix(100).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !prefix.hasPrefix("<") else {
@@ -359,11 +369,14 @@ class BookSaverView: ScreenSaverView {
             }
 
             let paragraphs = self.extractParagraphs(from: raw)
+            NSLog("[BookSaver] extractParagraphs (%d): %.1f ms", paragraphs.count, Date().timeIntervalSince(bgStart)*1000)
             guard !paragraphs.isEmpty else {
+                NSLog("[BookSaver] extractParagraphs returned empty!")
                 DispatchQueue.main.async { onComplete(nil) }; return
             }
 
             let lines = Self.reflow(paragraphs, font: capturedFont, maxWidth: capturedWidth)
+            NSLog("[BookSaver] reflow (%d lines, width=%.0f): %.1f ms", lines.count, capturedWidth, Date().timeIntervalSince(bgStart)*1000)
             guard !lines.isEmpty else {
                 DispatchQueue.main.async { onComplete(nil) }; return
             }
@@ -382,7 +395,9 @@ class BookSaverView: ScreenSaverView {
     // MARK: - Text processing
 
     private func extractParagraphs(from raw: String) -> [String] {
-        var all = raw.components(separatedBy: "\n")
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
+                            .replacingOccurrences(of: "\r",   with: "\n")
+        var all = normalized.components(separatedBy: "\n")
 
         var start = 0, end = all.count
         for (i, line) in all.enumerated() {
@@ -414,22 +429,28 @@ class BookSaverView: ScreenSaverView {
 
     private static func reflow(_ paragraphs: [String], font: NSFont, maxWidth: CGFloat) -> [String] {
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        let spaceWidth = (" " as NSString).size(withAttributes: attrs).width
         var result: [String] = []
 
         for (pi, para) in paragraphs.enumerated() {
             if pi > 0 { result.append("") }
             let words = para.components(separatedBy: " ").filter { !$0.isEmpty }
-            var current = ""
+            var lineWords: [String] = []
+            var lineWidth: CGFloat = 0
+
             for word in words {
-                let candidate = current.isEmpty ? word : current + " " + word
-                if (candidate as NSString).size(withAttributes: attrs).width > maxWidth, !current.isEmpty {
-                    result.append(current)
-                    current = word
+                let wordWidth = (word as NSString).size(withAttributes: attrs).width
+                let needed = lineWords.isEmpty ? wordWidth : lineWidth + spaceWidth + wordWidth
+                if needed > maxWidth, !lineWords.isEmpty {
+                    result.append(lineWords.joined(separator: " "))
+                    lineWords = [word]
+                    lineWidth = wordWidth
                 } else {
-                    current = candidate
+                    lineWords.append(word)
+                    lineWidth = needed
                 }
             }
-            if !current.isEmpty { result.append(current) }
+            if !lineWords.isEmpty { result.append(lineWords.joined(separator: " ")) }
         }
         return result
     }
@@ -467,9 +488,12 @@ class BookSaverView: ScreenSaverView {
         let lh      = lineHeight
         let metaTop = metaAreaHeight
 
+        // y decreases as i increases, so once a line falls below the visible
+        // area all subsequent lines will too — break rather than continue.
         for (i, line) in book.lines.enumerated() {
             let y = bounds.height - CGFloat(i + 1) * lh - scrollOffset
-            guard y > metaTop - lh * 0.1, y < bounds.height + lh else { continue }
+            guard y > metaTop - lh * 0.1 else { break }
+            guard y < bounds.height + lh   else { continue }
             let r = NSRect(x: sideMargin, y: y, width: textWidth, height: lh * 2)
             (line as NSString).draw(in: r, withAttributes: tAttrs)
         }
