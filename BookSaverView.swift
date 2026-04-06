@@ -102,6 +102,7 @@ class BookSaverView: ScreenSaverView {
 
     private var book: Book?
     private var scrollOffset: CGFloat = 0
+    private var bookStartTime: CFTimeInterval = 0
     private var isLoading = true
     private var loadingFrame = 0
 
@@ -136,12 +137,18 @@ class BookSaverView: ScreenSaverView {
         super.startAnimation()
     }
 
+    // Minimum seconds a book must scroll before advancing (full / preview).
+    private var minBookDuration: CFTimeInterval { isPreview ? 20 : 240 }
+
     override func animateOneFrame() {
         if isLoading {
             loadingFrame += 1
         } else if let current = book {
             scrollOffset += scrollSpeed
-            if scrollOffset > current.totalHeight + bounds.height * 0.25 {
+            let positionDone = scrollOffset > CGFloat(current.lines.count) * lineHeight + bounds.height
+            let timeDone     = CACurrentMediaTime() - bookStartTime >= minBookDuration
+            if positionDone && timeDone {
+                dbg("advance: lines=\(current.lines.count) lh=\(String(format:"%.1f",lineHeight)) bounds=\(Int(bounds.width))x\(Int(bounds.height)) elapsed=\(String(format:"%.0f",CACurrentMediaTime()-bookStartTime))s preview=\(isPreview)")
                 advanceBook()
             }
         }
@@ -177,7 +184,7 @@ class BookSaverView: ScreenSaverView {
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
         wantsLayer = true
-        // Defer one run-loop tick so bounds are finalised before we read them.
+        dbg("init: frame=\(Int(frame.width))x\(Int(frame.height)) preview=\(isPreview)")
         DispatchQueue.main.async { [weak self] in self?.loadInitialBook() }
     }
 
@@ -194,8 +201,9 @@ class BookSaverView: ScreenSaverView {
             NSLog("[BookSaver] loadBundledBook callback: %.1f ms", Date().timeIntervalSince(t0)*1000)
             guard let self else { return }
             if let b = book {
-                self.book = b
-                self.isLoading = false
+                self.book          = b
+                self.isLoading     = false
+                self.bookStartTime = CACurrentMediaTime()
                 NSLog("[BookSaver] book ready, isLoading=false: %.1f ms", Date().timeIntervalSince(t0)*1000)
             } else {
                 NSLog("[BookSaver] loadBundledBook returned nil!")
@@ -301,25 +309,28 @@ class BookSaverView: ScreenSaverView {
         }.resume()
     }
 
+    private func dbg(_ msg: String) {
+        NSLog("[BookSaver] %@", msg)
+    }
+
     private func advanceBook() {
         if let ready = nextBook {
-            // Network-fetched book is ready — use it instantly.
             book         = ready
-            nextBook     = nil
-            isLoading    = false
-            scrollOffset = 0
+            nextBook      = nil
+            isLoading     = false
+            scrollOffset  = 0
+            bookStartTime = CACurrentMediaTime()
             fetchNextBook()
         } else {
-            // Network wasn't ready — fall back to a bundled text.
-            // Show spinner briefly while the async load runs.
             book      = nil
             isLoading = true
-            loadBundledBook { [weak self] b in      // called back on main thread
+            loadBundledBook { [weak self] b in
                 guard let self else { return }
                 if let b {
-                    self.book         = b
-                    self.isLoading    = false
-                    self.scrollOffset = 0
+                    self.book          = b
+                    self.isLoading     = false
+                    self.scrollOffset  = 0
+                    self.bookStartTime = CACurrentMediaTime()
                 }
                 if !self.isFetchingNext { self.fetchNextBook() }
             }
@@ -400,9 +411,13 @@ class BookSaverView: ScreenSaverView {
         var all = normalized.components(separatedBy: "\n")
 
         var start = 0, end = all.count
+        let litOpts: String.CompareOptions = .literal
         for (i, line) in all.enumerated() {
-            if line.contains("*** START OF") || line.contains("***START OF") { start = i + 1 }
-            if line.contains("*** END OF")   || line.contains("***END OF")   { end   = i; break }
+            if start == 0,
+               line.range(of: "*** START OF",  options: litOpts) != nil ||
+               line.range(of: "***START OF",   options: litOpts) != nil { start = i + 1 }
+            if line.range(of: "*** END OF",    options: litOpts) != nil ||
+               line.range(of: "***END OF",     options: litOpts) != nil { end   = i; break }
         }
         if start == 0 { start = min(60, all.count / 8) }
         all = Array(all[start..<end])
@@ -431,6 +446,7 @@ class BookSaverView: ScreenSaverView {
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
         let spaceWidth = (" " as NSString).size(withAttributes: attrs).width
         var result: [String] = []
+        var widthCache: [String: CGFloat] = [:]
 
         for (pi, para) in paragraphs.enumerated() {
             if pi > 0 { result.append("") }
@@ -439,7 +455,14 @@ class BookSaverView: ScreenSaverView {
             var lineWidth: CGFloat = 0
 
             for word in words {
-                let wordWidth = (word as NSString).size(withAttributes: attrs).width
+                let wordWidth: CGFloat
+                if let cached = widthCache[word] {
+                    wordWidth = cached
+                } else {
+                    let w = (word as NSString).size(withAttributes: attrs).width
+                    widthCache[word] = w
+                    wordWidth = w
+                }
                 let needed = lineWords.isEmpty ? wordWidth : lineWidth + spaceWidth + wordWidth
                 if needed > maxWidth, !lineWords.isEmpty {
                     result.append(lineWords.joined(separator: " "))
@@ -491,7 +514,7 @@ class BookSaverView: ScreenSaverView {
         // y decreases as i increases, so once a line falls below the visible
         // area all subsequent lines will too — break rather than continue.
         for (i, line) in book.lines.enumerated() {
-            let y = bounds.height - CGFloat(i + 1) * lh - scrollOffset
+            let y = scrollOffset - CGFloat(i + 1) * lh
             guard y > metaTop - lh * 0.1 else { break }
             guard y < bounds.height + lh   else { continue }
             let r = NSRect(x: sideMargin, y: y, width: textWidth, height: lh * 2)

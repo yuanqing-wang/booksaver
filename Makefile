@@ -55,6 +55,7 @@ install: $(BUNDLE) texts
 	cp -r $(BUNDLE) $(INSTALL_DEST)
 	mkdir -p $(INSTALL_DEST)/Contents/Resources/Texts
 	cp $(TEXTS_DIR)/pg*.txt $(INSTALL_DEST)/Contents/Resources/Texts/
+	codesign --force --deep --sign - $(INSTALL_DEST)
 	@echo "Installed — open System Settings › Screen Saver to activate"
 
 uninstall:
